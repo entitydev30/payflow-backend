@@ -1,10 +1,18 @@
 import type { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { rpc } from "@stellar/stellar-sdk";
+import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
-import { readCursor, writeCursor } from "./lib/db.ts";
+import {
+  clearProjections,
+  insertEvent,
+  iterateEvents,
+  readCursor,
+  writeCursor,
+  type StoredEvent,
+} from "./lib/db.ts";
 import {
   big,
   decodeEvent,
@@ -28,6 +36,91 @@ export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "get
 
 /** What `apply` did with an event, so a pass can account for every one. */
 export type ApplyOutcome = "applied" | "mismatched" | "unknown";
+
+/**
+ * Identity of a raw event, used as the `events` table's idempotency key.
+ *
+ * The RPC's paging token is unique per event and stable across reads, so it is
+ * the key whenever it is present. Hand-built events (tests) may lack one; for
+ * those, position within the transaction plus a digest of the encoded topics
+ * and data derives an equally stable key.
+ */
+function eventId(raw: rpc.Api.EventResponse): string {
+  if (typeof raw.id === "string" && raw.id !== "") return raw.id;
+  const txIndex = typeof raw.transactionIndex === "number" ? raw.transactionIndex : 0;
+  const opIndex = typeof raw.operationIndex === "number" ? raw.operationIndex : 0;
+  const digest = createHash("sha256")
+    .update(raw.topic.map((t) => t.toXDR("base64")).join())
+    .update(raw.value.toXDR("base64"))
+    .digest("hex")
+    .slice(0, 16);
+  return `${raw.txHash}:${txIndex}:${opIndex}:${digest}`;
+}
+
+/**
+ * One raw RPC event as an `events` table row, kept before the projection sees
+ * it — including events whose name the spec does not know or validate, which
+ * are exactly the ones a future projection needs.
+ */
+function toStoredEvent(raw: rpc.Api.EventResponse, closeTime: number | null): StoredEvent {
+  let name: string | null = null;
+  try {
+    const first = raw.topic[0] === undefined ? undefined : scValToNative(raw.topic[0]);
+    if (typeof first === "string") name = first;
+  } catch {
+    // A topic that does not decode is stored raw; the name column stays NULL.
+  }
+  return {
+    id: eventId(raw),
+    type: typeof raw.type === "string" ? raw.type : "contract",
+    contract: raw.contractId?.toString() ?? "",
+    ledger: raw.ledger,
+    txHash: raw.txHash,
+    txIndex: typeof raw.transactionIndex === "number" ? raw.transactionIndex : 0,
+    opIndex: typeof raw.operationIndex === "number" ? raw.operationIndex : 0,
+    name,
+    // XDR encoded as base64 inside JSON: the exact bytes the chain emitted,
+    // with nothing forced through a JavaScript number on the way back.
+    topics: JSON.stringify(raw.topic.map((t) => t.toXDR("base64"))),
+    data: JSON.stringify({ xdr: raw.value.toXDR("base64") }),
+    closeTime,
+    successful: raw.inSuccessfulContractCall !== false,
+  };
+}
+
+/**
+ * Decode a stored event back into the shape `apply` consumes. This mirrors
+ * `decodeEvent` in lib/stellar.ts exactly — same topic split, same data
+ * wrapping, same close time — because a rebuild has to reproduce the live
+ * projection bit for bit.
+ */
+function decodeStoredEvent(row: StoredEvent): DecodedEvent | null {
+  try {
+    const topics = (JSON.parse(row.topics) as string[]).map((b64) =>
+      scValToNative(xdr.ScVal.fromXDR(b64, "base64")),
+    );
+    const dataXdr = (JSON.parse(row.data) as { xdr?: string }).xdr;
+    if (typeof dataXdr !== "string") return null;
+    const value = scValToNative(xdr.ScVal.fromXDR(dataXdr, "base64"));
+    const data =
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : { value };
+    const [name, ...rest] = topics;
+    if (typeof name !== "string") return null;
+    return {
+      name,
+      contractId: row.contract,
+      ledger: row.ledger,
+      txHash: row.txHash,
+      topics: rest,
+      data,
+      closeTime: row.closeTime,
+    };
+  } catch {
+    return null;
+  }
+}
 
 export interface TickResult {
   /** Events applied in this pass. */
@@ -299,6 +392,12 @@ export class Indexer {
       for (const raw of result.value) {
         const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
         if (ct !== null) lastSeenCloseTime = ct;
+        // Keep every raw event before the projection sees it. The insert is
+        // idempotent on the event id, so a replayed or overlapping range
+        // stores nothing twice, and an event the projection cannot use yet
+        // (unknown name, spec mismatch, undecodable) is still here when a new
+        // projection is built with `rebuild`.
+        insertEvent(this.db, toStoredEvent(raw, ct));
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if (this.apply(decoded) !== "mismatched") applied += 1;
@@ -314,6 +413,36 @@ export class Indexer {
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
+  }
+
+  /**
+   * Rebuild every projection from the stored raw events (`npm run rebuild`).
+   *
+   * Projections are cleared and re-derived by replaying the `events` table in
+   * chain order through the same `apply` the live indexer uses — so the result
+   * is identical to a full re-index from RPC, without RPC. That is what makes
+   * a new or fixed projection deployable after history has left the RPC node's
+   * retention window. The cursor and the raw event log are untouched.
+   *
+   * node:sqlite is synchronous, so this blocks the event loop for its
+   * duration; run it from the offline command, never on a serving process.
+   */
+  rebuild(): { events: number; applied: number; mismatched: number } {
+    clearProjections(this.db);
+    let events = 0;
+    let applied = 0;
+    let mismatched = 0;
+    for (const row of iterateEvents(this.db)) {
+      events += 1;
+      const decoded = decodeStoredEvent(row);
+      // An event that does not decode is kept raw and skipped, exactly as the
+      // live pass skips it; everything else goes through the same validation
+      // and projection as before.
+      if (!decoded) continue;
+      if (this.apply(decoded) === "mismatched") mismatched += 1;
+      else applied += 1;
+    }
+    return { events, applied, mismatched };
   }
 
   /** Run passes until the cursor reaches the RPC's latest ledger. */
@@ -491,7 +620,11 @@ export class Indexer {
         num(e.data.charges_made),
         num(e.data.next_charge),
         e.ledger,
-        Date.now(),
+        // The ledger's close time, not the indexer's wall clock: the charge's
+        // age is chain history, and a value the clock cannot change is what
+        // lets a rebuild reproduce this row exactly. The clock is only a
+        // fallback for an event the RPC did not timestamp.
+        e.closeTime ?? Date.now(),
       );
 
     // The Charged event carries next_charge but not last_charge. The contract

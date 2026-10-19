@@ -19,6 +19,7 @@
     "start": "node dist/index.js",
     "dev": "node --watch --experimental-strip-types src/index.ts",
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
+    "rebuild": "node --experimental-strip-types src/cmd/rebuild.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",

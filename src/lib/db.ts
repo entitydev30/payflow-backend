@@ -15,6 +15,19 @@ import { DatabaseSync } from "node:sqlite";
  * of the event. It is keyed on (mandate_id, slot) and written with
  * INSERT OR IGNORE, so replaying a ledger range cannot record the same
  * event — or the same departure — twice.
+ *
+ * `events` is the raw event log every projection is built from: one row per
+ * contract event the RPC returned, kept verbatim so a new or fixed projection
+ * can be rebuilt without re-reading history from RPC (which only retains about
+ * a week). The plan is to store topics and data "as JSON", but native JSON
+ * cannot round-trip what a Soroban event carries — i128 amounts would have to
+ * pass through a JavaScript number and byte buffers have no JSON form — so
+ * both columns hold the chain's own XDR encoded as base64 inside a JSON value
+ * (an array per topic list, an {"xdr": ...} object for the data map). A
+ * rebuild re-decodes those exact bytes, so the projection it produces is
+ * bit-identical to the one live indexing produced. Rows are keyed on the RPC
+ * event id (its paging token, unique per event) and written with INSERT OR
+ * IGNORE, so a replayed or overlapping ledger range stores nothing twice.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cursor (
@@ -117,6 +130,29 @@ CREATE TABLE IF NOT EXISTS mandate_events (
   PRIMARY KEY (mandate_id, slot)
 );
 CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
+
+-- Every raw contract event, verbatim, so projections can be rebuilt without
+-- RPC history (see the schema notes above). topics is a JSON array of
+-- base64 XDR values, data an {"xdr": ...} JSON object; name is topic 0
+-- decoded for queries and is NULL when the event does not decode. id is the
+-- RPC paging token; tx/op indexes and close_time keep ordering and chain time.
+CREATE TABLE IF NOT EXISTS events (
+  id          TEXT    PRIMARY KEY,
+  type        TEXT    NOT NULL DEFAULT 'contract',
+  contract    TEXT    NOT NULL,
+  ledger      INTEGER NOT NULL,
+  tx_hash     TEXT    NOT NULL,
+  tx_index    INTEGER NOT NULL DEFAULT 0,
+  op_index    INTEGER NOT NULL DEFAULT 0,
+  name        TEXT,
+  topics      TEXT    NOT NULL,
+  data        TEXT    NOT NULL,
+  close_time  INTEGER,
+  successful  INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS events_ledger          ON events(ledger);
+CREATE INDEX IF NOT EXISTS events_contract_ledger ON events(contract, ledger);
+CREATE INDEX IF NOT EXISTS events_tx_hash         ON events(tx_hash);
 `;
 
 /**
@@ -185,4 +221,121 @@ export function writeCursor(db: DatabaseSync, ledger: number): void {
     `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
      ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
   ).run(ledger);
+}
+
+/** One raw contract event as stored in the `events` table. */
+export interface StoredEvent {
+  /** RPC paging token, unique per event; the idempotency key. */
+  id: string;
+  /** RPC event type; `contract` for everything the indexer filters for. */
+  type: string;
+  /** Contract that emitted the event; empty when the RPC did not report one. */
+  contract: string;
+  ledger: number;
+  txHash: string;
+  /** Index of the emitting transaction within its ledger. */
+  txIndex: number;
+  /** Index of the emitting operation within its transaction. */
+  opIndex: number;
+  /** Topic 0 decoded to a string, or null when it does not decode. */
+  name: string | null;
+  /** JSON array of base64 XDR values, one entry per topic. */
+  topics: string;
+  /** JSON object of the form {"xdr": "<base64>"} holding the data section's XDR. */
+  data: string;
+  /** Ledger close time in unix seconds; null when the RPC did not report one. */
+  closeTime: number | null;
+  /** Whether the event came from a successful contract call. */
+  successful: boolean;
+}
+
+/**
+ * Store one raw event. INSERT OR IGNORE on the primary key makes this
+ * idempotent: a crashed pass that replays its range, or an overlapping range,
+ * stores nothing twice.
+ */
+export function insertEvent(db: DatabaseSync, event: StoredEvent): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO events
+       (id, type, contract, ledger, tx_hash, tx_index, op_index,
+        name, topics, data, close_time, successful)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    event.id,
+    event.type,
+    event.contract,
+    event.ledger,
+    event.txHash,
+    event.txIndex,
+    event.opIndex,
+    event.name,
+    event.topics,
+    event.data,
+    event.closeTime,
+    event.successful ? 1 : 0,
+  );
+}
+
+/**
+ * Every stored event from `fromLedger` onward, in the order the chain emitted
+ * it: ledger, then transaction index, then operation index, then paging token
+ * (which encodes the event's position within its operation, zero-padded so it
+ * sorts correctly as text). Replaying in this order is what makes a rebuilt
+ * projection identical to the one live indexing produced — a `subscribed`
+ * always precedes the `charged` events that followed it on-chain.
+ */
+export function* iterateEvents(
+  db: DatabaseSync,
+  fromLedger = 0,
+): Generator<StoredEvent, void, undefined> {
+  const rows = db
+    .prepare(
+      `SELECT id, type, contract, ledger, tx_hash, tx_index, op_index,
+              name, topics, data, close_time, successful
+         FROM events
+        WHERE ledger >= ?
+        ORDER BY ledger, tx_index, op_index, id`,
+    )
+    .all(fromLedger) as Array<{
+    id: string;
+    type: string;
+    contract: string;
+    ledger: number;
+    tx_hash: string;
+    tx_index: number;
+    op_index: number;
+    name: string | null;
+    topics: string;
+    data: string;
+    close_time: number | null;
+    successful: number;
+  }>;
+  for (const row of rows) {
+    yield {
+      id: row.id,
+      type: row.type,
+      contract: row.contract,
+      ledger: row.ledger,
+      txHash: row.tx_hash,
+      txIndex: row.tx_index,
+      opIndex: row.op_index,
+      name: row.name,
+      topics: row.topics,
+      data: row.data,
+      closeTime: row.close_time,
+      successful: row.successful === 1,
+    };
+  }
+}
+
+/**
+ * Empty every projection table, leaving the raw `events` log and the cursor
+ * untouched. This is the first half of a rebuild: the projections are then
+ * re-derived by replaying `events` through `Indexer.apply`.
+ */
+export function clearProjections(db: DatabaseSync): void {
+  db.exec(
+    "DELETE FROM plans; DELETE FROM mandates; DELETE FROM charges; " +
+      "DELETE FROM vault_events; DELETE FROM fee_history; DELETE FROM mandate_events;",
+  );
 }

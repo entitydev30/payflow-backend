@@ -49,6 +49,11 @@ replays that range on restart. Every write is designed for that:
   double-count revenue.
 - Mandate updates are guarded by `WHERE charges_made < ?`, so an out-of-order
   event can never move a mandate backwards.
+- Every raw contract event is also stored verbatim in the `events` table,
+  keyed on the RPC event id and written with `INSERT OR IGNORE` — a replayed
+  or overlapping range stores nothing twice. The log outlives the RPC node's
+  ~7-day retention window, so projections can be rebuilt from it at any time
+  (`npm run rebuild`), including after a new or fixed projection ships.
 
 ## Quick start
 
@@ -63,6 +68,14 @@ Index until caught up with the network, then exit (cron, backfills):
 
 ```bash
 npm run indexer
+```
+
+Rebuild every projection from the stored raw events (`events` table) with no
+RPC calls — what you run after deploying a new projection, or once history has
+left the RPC node's retention window:
+
+```bash
+npm run rebuild
 ```
 
 Run one settlement pass and exit (needs `KEEPER_SECRET`):
@@ -95,7 +108,9 @@ npm run keeper
   or retyped contract field makes the event fail validation: it is logged with
   the exact problems, counted in `/health`'s `indexer.mismatchedEvents`, and
   never silently stored as zeros. Update the spec file together with the
-  contracts.
+  contracts. Either way the raw event is stored in the `events` table first,
+  so a fixed spec can re-derive the projection with `npm run rebuild` without
+  re-reading history from RPC.
 
 ### Reconciling the projection with the chain
 
